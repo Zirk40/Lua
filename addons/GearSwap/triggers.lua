@@ -85,7 +85,7 @@ windower.register_event('outgoing text',function(original,modified,blocked,ffxi,
     else
         res_index = validabils[language][unified_prefix][abil]
     end
-    _,temp_mob_arr = valid_target(targ)
+    temp_mob_arr = valid_target(targ)
     if not (res_index and temp_mob_arr) then return modified end
 
     if st_flag then

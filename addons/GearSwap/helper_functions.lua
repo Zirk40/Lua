@@ -433,26 +433,26 @@ end
 
 
 -----------------------------------------------------------------------------------
---Name: initialize_arrow_offset(mob_table)
---Desc: Returns the current target arrow offset.
+--Name: initialize_arrow_offset(target_arrow,mob_table)
+--Desc: Updates target_arrow with the current target arrow offset.
 --Args:
+---- target_arrow - Table which will have the target arrow offset written to it
 ---- mob_table - Monster table of the target monster
 -----------------------------------------------------------------------------------
 --Returns:
----- table - Keys x, y, and z with the respective current offsets from the target.
+---- nil
 -----------------------------------------------------------------------------------
-function initialize_arrow_offset(mob_table)
-    local backtab = {}
+function initialize_arrow_offset(target_arrow,mob_table)
     local arrow = windower.ffxi.get_info().target_arrow
 
     if arrow.x == 0 and arrow.y == 0 and arrow.z == 0 then
-        return arrow
+        table.update(target_arrow, arrow)
+        return
     end
 
-    backtab.x = arrow.x-mob_table.x
-    backtab.y = arrow.y-mob_table.y
-    backtab.z = arrow.z-mob_table.z
-    return backtab
+    target_arrow.x = arrow.x-mob_table.x
+    target_arrow.y = arrow.y-mob_table.y
+    target_arrow.z = arrow.z-mob_table.z
 end
 
 
@@ -632,6 +632,27 @@ function is_usable_item(i_tab,bag_id)
 end
 
 -----------------------------------------------------------------------------------
+--Name: find_monster_skill_index(abil)
+--Desc: Finds the correct index in the monster_skills resource for the given
+--      ability name.
+--Args:
+---- abil - Ability name used
+-----------------------------------------------------------------------------------
+--Returns:
+---- i - Index for ability name in monster_skills resource table
+-----------------------------------------------------------------------------------
+function find_monster_skill_index(abil)
+    if player.species and player.species.tp_moves then
+        -- Iterates over currently available monster TP moves
+        for i,_ in pairs(player.species.tp_moves) do
+            if res.monster_skills[i][language]:lower() == abil then
+                return i
+            end
+        end
+    end
+end
+
+-----------------------------------------------------------------------------------
 --Name: number_of_jps(jp_tab)
 --Desc: Gives the total number of job points spent on that job
 --Args:
@@ -760,6 +781,11 @@ function filter_precast(spell)
     if not spell.target.id or not spell.target.index then
         if debugging.general then msg.debugging('No target id or index') end
         return false
+    elseif spell.prefix == '/item' and bit.band(spell.target.spawn_type, 2) == 2 then
+        spell.action_type = 'Trade'
+        if spell.target.distance > 6 then
+            return false
+        end
     end
     return true
 end
@@ -812,9 +838,9 @@ function cmd_reg:new_entry(sp)
     while rawget(self,ts) do
         ts = ts+0.001
     end
-    rawset(self,ts,{pretarget_cast_delay=0, precast_cast_delay=0, cancel_spell=false, new_target=false, current_event='nascent', spell=sp, timestamp=ts,target_arrow={x=0,y=0,z=0}})
+    rawset(self,ts,{spell=sp, timestamp=ts})
     if debugging.command_registry then
-        msg.addon_msg('Creating a new command_registry entry: '..windower.to_shift_jis(tostring(ts)..' '..tostring(self[ts])))
+        msg.addon_msg(123,'Creating a new command_registry entry: '..windower.to_shift_jis(tostring(ts)..' '..tostring(self[ts])))
     end
     return ts
 end
@@ -966,7 +992,7 @@ function get_spell(act)
     end
 
     if act.category == 12 or act.category == 2 then
-        spell = copy_entry(resources_ranged_attack)
+        spell = copy_entry(res.ranged_attacks[0])
     else
         if not res.action_messages[msg_ID] or msg_ID == 31 then
             if act.category == 4 or act.category == 8 then

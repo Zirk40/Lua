@@ -27,6 +27,51 @@
 
 
 -----------------------------------------------------------------------------------
+--Name: flow_entry(r_line,mob_table)
+--Desc: Common entry point to begin GearSwap flow. Finishes building the spell
+--      table and is responsible for doing anything that is trigger-agnostic.
+--Args:
+---- r_line - resource line
+---- mob_table - GearSwap amended mob table for the provided target
+-----------------------------------------------------------------------------------
+--Returns:
+---- If unable to fire the action : originally entered command
+---- Otherwise : true
+-----------------------------------------------------------------------------------
+function flow_entry(r_line,mob_table)
+    r_line.name = r_line[language] -- Resource redicting should take care of this for us
+    local spell = spell_complete(r_line)
+    spell.target = mob_table
+    spell.action_type = action_type_map[spell.prefix]
+
+    local target_id_provided_directly = type(tonumber(spell.target.raw)) == 'number'
+    -- If it was known that a spell was cast from menu then we could skip pretarget
+    -- entirely and go straight to precast since the client has performed filter_pretarget
+    -- validation for us. Unfortunately it is not possible in Windower v4 to differentiate
+    -- between a menu cast, an <st> subtarget cast, or an addon providing the target ID.
+    -- For this reason we cannot skip filter_pretarget's checks when a target ID is
+    -- provided, but will still skip entering the pretarget event since the target
+    -- has already been finalized.
+
+    table.update(_global,global_init,true)
+
+    if not filter_pretarget(spell) then
+        return equip_sets('filtered_action',-1,spell)
+    end
+
+    if not target_id_provided_directly then
+        return equip_sets('pretarget',-1,spell)
+    end
+
+    if filter_precast(spell) then
+        return equip_sets('precast',-1,spell)
+    end
+
+    return storedcommand..' '..spell.target.raw
+end
+
+
+-----------------------------------------------------------------------------------
 --Name: equip_sets(swap_type,ts,val1,val2)
 --Desc: General purpose equipment pipeline / user function caller. 
 --Args:
@@ -41,19 +86,43 @@
 ---- Everything else : nil
 -----------------------------------------------------------------------------------
 function equip_sets(swap_type,ts,...)
-    local results
+    local results, proposed_packet
     local var_inps = {...}
     local val1 = var_inps[1]
     local val2 = var_inps[2]
-    table.reassign(_global,command_registry[ts] or {pretarget_cast_delay = 0,precast_cast_delay=0,cancel_spell = false, new_target=false,target_arrow={x=0,y=0,z=0}})
     _global.current_event = tostring(swap_type)
+    equip_sets_debug_info(swap_type,val1,val2)
 
-    if _global.current_event == 'precast' and val1 and val1.english and val1.english:find('Geo-') then
-        _global.target_arrow = initialize_arrow_offset(val1.target)
+    if _global.current_event == 'precast' then
+        if val1.storedcommand then
+            -- storedcommand being in the spell table means this spell was scheduled for later
+            storedcommand = val1.storedcommand
+            val1.storedcommand = nil
+
+            -- Global vars could be in any state since we yielded, so reinitialize
+            table.update(_global,global_init,true)
+        end
+
+        if val1.english and val1.english:find('Geo-') then
+            -- Truthfully the target_arrow belongs in the spell table, but to minimize risk
+            -- of user space having any adverse reactions to gearswap changes, we'll keep
+            -- everything from user space's perspective identical.
+            initialize_arrow_offset(_global.target_arrow,val1.target)
+
+            -- Don't assemble packet yet in this case since user function
+            -- may want to adjust target_arrow, so we'll wait for that so
+            -- we only need to assemble the action packet once.
+        else
+            -- Potential behavior change: wait to see if user function decides to cancel the spell
+            -- in precast before bothering to assemble the packet.
+            proposed_packet = assemble_proposed_packet(val1)
+            if not proposed_packet then
+                return storedcommand..' '..val1.target.raw
+            end
+        end
+    elseif _global.current_event == 'midcast' then
+        command_registry[ts].midaction = true
     end
-
-    windower.debug(tostring(swap_type)..' enter')
-    if showphase or debugging.general then msg.debugging(8,windower.to_shift_jis(tostring(swap_type))..' enter') end
 
     local cur_equip = table.reassign({},update_equipment())
 
@@ -65,34 +134,9 @@ function equip_sets(swap_type,ts,...)
         end
     end
 
-    logit('\n\n'..tostring(os.clock)..'(15) equip_sets: '..tostring(swap_type))
-    if val1 then
-        if type(val1) == 'table' and val1.english then
-            logit(' : '..val1.english)
-        else
-            logit(' : Unknown type val1- '..tostring(val1))
-        end
-    else
-        logit(' : nil-or-false')
-    end
-    if val2 then
-        if type(val2) == 'table' and val2.type then logit(' : '..val2.type)
-        else
-            logit(' : Unknown type val2- '..tostring(val2))
-        end
-    else
-        logit(' : nil-or-false')
-    end
-
-    if type(swap_type) == 'string' then
-        msg.debugging("Entering "..swap_type)
-    else
-        msg.debugging("Entering User Event "..tostring(swap_type))
-    end
-
     if not val1 then val1 = {}
         if debugging.general then
-            msg.debugging(8,'val1 error')
+            msg.debugging('val1 error')
         end
     end
 
@@ -106,14 +150,20 @@ function equip_sets(swap_type,ts,...)
         user_pcall(swap_type,...)
     end
 
-    if type(swap_type) == 'string' and (swap_type == 'pretarget' or swap_type == 'filtered_action') then -- Target may just have been changed, so make the ind now.
-        ts = command_registry:new_entry(val1)
+    if _global.current_event == 'precast' and val1.english and val1.english:find('Geo-') then
+        proposed_packet = assemble_proposed_packet(val1)
+        if not proposed_packet then
+            return storedcommand..' '..val1.target.raw
+        end
     end
 
-    if player.race ~= 'Precomposed NPC' then
+    if player.race == 'Precomposed NPC' then
         -- Short circuits the routine and gets out before equip processing
         -- if there's no swapping to be done because the user is a monster.
-
+        if _global.current_event == 'midcast' and command_registry[ts] and command_registry[ts].proposed_packet and not _settings.demo_mode then
+            windower.packets.inject_outgoing(command_registry[ts].proposed_packet:byte(1),command_registry[ts].proposed_packet)
+        end
+    else
         for v,i in pairs(default_slot_map) do
             if equip_list[i] and encumbrance_table[v] then
                 not_sent_out_equip[i] = equip_list[i]
@@ -152,7 +202,7 @@ function equip_sets(swap_type,ts,...)
                 end
             end
 
-            if swap_type == 'midcast' and command_registry[ts] and command_registry[ts].proposed_packet and not _settings.demo_mode then
+            if _global.current_event == 'midcast' and command_registry[ts] and command_registry[ts].proposed_packet and not _settings.demo_mode then
                 windower.packets.inject_outgoing(command_registry[ts].proposed_packet:byte(1),command_registry[ts].proposed_packet)
             end
 
@@ -170,9 +220,51 @@ function equip_sets(swap_type,ts,...)
                 end
             end
         end
-    else
-        if swap_type == 'midcast' and command_registry[ts] and command_registry[ts].proposed_packet and not _settings.demo_mode then
-            windower.packets.inject_outgoing(command_registry[ts].proposed_packet:byte(1),command_registry[ts].proposed_packet)
+    end
+
+    if _global.cancel_spell and (_global.current_event == 'filtered_action' or _global.current_event == 'pretarget' or _global.current_event == 'precast') then
+        -- Potential feature add / behavior change: if user function says to cancel the spell
+        -- just cancel it immediately, rather than waiting until after we've swapped gear to cancel.
+        msg.debugging('Action canceled ('..storedcommand..' '..val1.target.raw..')')
+        return true
+    elseif _global.current_event == 'pretarget' then
+        if _global.new_target then
+            val1.target = _global.new_target
+        end
+
+        if st_targs[val1.target.raw] then
+            st_flag = true
+            return storedcommand..' '..val1.target.raw
+        elseif filter_precast(val1) then
+            if _global.pretarget_cast_delay == 0 then
+                return equip_sets('precast',ts,val1)
+            else
+                val1.storedcommand = storedcommand
+                equip_sets:schedule(_global.pretarget_cast_delay,'precast',ts,val1)
+                return true
+            end
+        else
+            -- Did not have a valid target to be able to enter precast
+            return storedcommand..' '..val1.target.raw
+        end
+    elseif _global.current_event == 'precast' then
+        -- Only invoke the command registry when we will for sure fire
+        ts = command_registry:new_entry(val1)
+        command_registry[ts].proposed_packet = proposed_packet
+
+        if _global.precast_cast_delay == 0 then
+            equip_sets('midcast',ts,val1)
+        else
+            command_registry[ts].precast_cast_delay = _global.precast_cast_delay
+            equip_sets:schedule(_global.precast_cast_delay,'midcast',ts,val1)
+        end
+        return true
+    elseif _global.current_event == 'midcast' and _settings.demo_mode then
+        command_registry[ts].midaction = false
+        equip_sets('aftercast',ts,val1)
+    elseif _global.current_event == 'aftercast' or _global.current_event == 'pet_aftercast' then
+        if ts then
+            command_registry:delete_entry(ts)
         end
     end
 
@@ -180,127 +272,6 @@ function equip_sets(swap_type,ts,...)
 
     if type(swap_type) == 'function' then
         return unpack(results)
-    end
-
-    return equip_sets_exit(swap_type,ts,val1)
-end
-
-
------------------------------------------------------------------------------------
---Name: equip_sets_exit(swap_type,ind,val1)
---Desc: Cleans up the global table and leaves equip_sets properly.
---Args:
----- swap_type - Current swap type for equip_sets
----- ts - Current index of command_registry
----- val1 - First argument of equip_sets
------------------------------------------------------------------------------------
---Returns:
----- none
------------------------------------------------------------------------------------
-function equip_sets_exit(swap_type,ts,val1)
-    if command_registry[ts] then
-        table.update(command_registry[ts],_global)
-    end
-    if type(swap_type) == 'string' then
-        if swap_type == 'pretarget' then
-
-            if command_registry[ts].cancel_spell then
-                msg.debugging("Action canceled ("..storedcommand..' '..val1.target.raw..")")
-                storedcommand = nil
-                command_registry:delete_entry(ts)
-                return true
-            elseif not ts or not command_registry[ts] or not storedcommand then
-                msg.debugging('This case should not be hittable - 1')
-                return true
-            end
-
-            if command_registry[ts].new_target then
-                val1.target = command_registry[ts].new_target -- Switch target, if it is requested.
-            end
-
-            -- Compose a proposed packet for the given action (this should be possible after pretarget)
-            command_registry[ts].spell = val1
-            if val1.target and val1.target.id and val1.target.index and val1.prefix and unify_prefix[val1.prefix] then
-                if val1.prefix == '/item' then
-                    -- Item use packet handling here
-                    if bit.band(val1.target.spawn_type, 2) == 2 and find_inventory_item(val1.id) then
-                        -- 0x36 packet
-                        if val1.target.distance <= 6 then
-                            command_registry[ts].proposed_packet = assemble_menu_item_packet(val1.target.id,val1.target.index,val1.id)
-                        else
-                            windower.add_to_chat(67, "Target out of range.")
-                        end
-                    elseif find_usable_item(val1.id) then
-                        -- 0x37 packet
-                        command_registry[ts].proposed_packet = assemble_use_item_packet(val1.target.id,val1.target.index,val1.id)
-                    end
-                    if not command_registry[ts].proposed_packet then
-                        command_registry:delete_entry(ts)
-                    end
-                elseif outgoing_action_category_table[unify_prefix[val1.prefix]] then
-                    if filter_precast(val1) then
-                        command_registry[ts].proposed_packet = assemble_action_packet(val1.target.id,val1.target.index,outgoing_action_category_table[unify_prefix[val1.prefix]],val1.id,command_registry[ts].target_arrow)
-                        if not command_registry[ts].proposed_packet then
-                            command_registry:delete_entry(ts)
-
-                            msg.debugging("Unable to create a packet for this command because the target is still invalid after pretarget ("..storedcommand..' '..val1.target.raw..")")
-                            storedcommand = nil
-                            return storedcommand..' '..val1.target.raw
-                        end
-                    end
-                else
-                    msg.debugging(8,"Hark, what weird prefix through yonder window breaks? "..tostring(val1.prefix))
-                end
-            end
-
-            if ts and command_registry[ts] and val1.target then
-                if st_targs[val1.target.raw] then
-                -- st targets
-                    st_flag = true
-                elseif not val1.target.name then
-                -- Spells with invalid pass_through_targs, like using <t> without a target
-                    command_registry:delete_entry(ts)
-                    msg.debugging("Change target was used to pick an invalid target ("..storedcommand..' '..val1.target.raw..")")
-                    local ret = storedcommand..' '..val1.target.raw
-                    storedcommand = nil
-                    return ret
-                else
-                -- Spells with complete target information
-                -- command_registry[ts] is deleted for cancelled spells
-                    if command_registry[ts].pretarget_cast_delay == 0 then
-                        equip_sets('precast',ts,val1)
-                    else
-                        windower.send_command('@wait '..command_registry[ts].pretarget_cast_delay..';lua i '.._addon.name..' pretarget_delayed_cast '..ts)
-                    end
-                    return true
-                end
-            elseif not ts or not command_registry[ts] then
-                msg.debugging('This case should not be hittable - 2')
-                return true
-            end
-
-        elseif swap_type == 'precast' then
-            -- Update the target_arrow
-            if val1.prefix ~= '/item' then
-                command_registry[ts].proposed_packet = assemble_action_packet(val1.target.id,val1.target.index,outgoing_action_category_table[unify_prefix[val1.prefix]],val1.id,command_registry[ts].target_arrow)
-            end
-            return precast_send_check(ts)
-        elseif swap_type == 'filtered_action' and command_registry[ts] and command_registry[ts].cancel_spell then
-            storedcommand = nil
-            command_registry:delete_entry(ts)
-            return true
-        elseif swap_type == 'midcast' and _settings.demo_mode then
-            command_registry[ts].midaction = false
-            equip_sets('aftercast',ts,val1)
-        elseif swap_type == 'aftercast' then
-            if ts then
-                command_registry:delete_entry(ts)
-            end
-        elseif swap_type == 'pet_aftercast' then
-            if ts then
-                command_registry:delete_entry(ts)
-            end
-        end
     end
 end
 
@@ -348,83 +319,70 @@ end
 
 
 -----------------------------------------------------------------------------------
---Name: pretarget_delayed_cast(ts)
---Desc: Triggers an outgoing action packet (if the passed key is valid).
+--Name: assemble_proposed_packet(spell)
+--Desc: Puts together the correct packet for the requested spell.
 --Args:
----- ts - Timestamp argument to precast_delayed_cast
+---- spell - Spell table for the requested spell
 -----------------------------------------------------------------------------------
 --Returns:
 ---- none
 -----------------------------------------------------------------------------------
-function pretarget_delayed_cast(ts)
-    ts = tonumber(ts)
-    if ts then
-        equip_sets('precast',ts,command_registry[ts].spell)
+function assemble_proposed_packet(spell)
+    local proposed_packet
+    if spell.action_type == 'Trade' then
+        -- 0x36 packet
+        proposed_packet = assemble_menu_item_packet(spell.target.id,spell.target.index,spell.id)
+    elseif spell.action_type == 'Item' then
+        -- 0x37 packet
+        proposed_packet = assemble_use_item_packet(spell.target.id,spell.target.index,spell.id)
+    elseif outgoing_action_category_table[unify_prefix[spell.prefix]] then
+        -- 0x1A packet
+        proposed_packet = assemble_action_packet(spell.target.id,spell.target.index,outgoing_action_category_table[unify_prefix[spell.prefix]],spell.id,_global.target_arrow)
     else
-        msg.debugging("Bad index passed to pretarget_delayed_cast")
+        msg.debugging("Hark, what weird prefix through yonder window breaks? "..tostring(spell.prefix))
     end
+    return proposed_packet
 end
 
 
-
 -----------------------------------------------------------------------------------
---Name: precast_send_check(ts)
---Desc: Determines whether or not to send the current packet.
---      Cancels if _global.cancel_spell is true
---          If command_registry[ts].precast_cast_delay is not 0, cues precast_delayed_cast with the proper
---          delay instead of sending immediately.
+--Name: equip_sets_debug_info(swap_type,val1,val2)
+--Desc: Consolidates a bunch of debug prints to reduce noise in the main code path.
 --Args:
----- ts - key of command_registry
+---- swap_type - Determines equip_sets' behavior in terms of which user function it
+--      attempts to call
+---- val1 - First argument to be passed to the user function
+---- val2 - Second argument to be passed to the user function
 -----------------------------------------------------------------------------------
 --Returns:
----- true (to block) or the outgoing packet
+---- none
 -----------------------------------------------------------------------------------
-function precast_send_check(ts)
-    if ts and command_registry[ts] then
-        if command_registry[ts].cancel_spell then
-            command_registry:delete_entry(ts)
+function equip_sets_debug_info(swap_type,val1,val2)
+    windower.debug(tostring(swap_type)..' enter')
+    if showphase or debugging.general then msg.debugging(windower.to_shift_jis(tostring(swap_type))..' enter') end
+
+    logit('\n\n'..tostring(os.clock)..'(15) equip_sets: '..tostring(swap_type))
+    if val1 then
+        if type(val1) == 'table' and val1.english then
+            logit(' : '..val1.english)
         else
-            if command_registry[ts].precast_cast_delay == 0 then
-                send_action(ts)
-                return
-            else
-                windower.send_command('@wait '..command_registry[ts].precast_cast_delay..';lua i '.._addon.name..' precast_delayed_cast '..ts)
-            end
+            logit(' : Unknown type val1- '..tostring(val1))
         end
-    end
-    return true
-end
-
-
------------------------------------------------------------------------------------
---Name: precast_delayed_cast(ts)
---Desc: Triggers an outgoing action packet (if the passed key is valid).
---Args:
----- ts - Timestamp argument to precast_delayed_cast
------------------------------------------------------------------------------------
---Returns:
----- none
------------------------------------------------------------------------------------
-function precast_delayed_cast(ts)
-    ts = tonumber(ts)
-    if ts then
-        send_action(ts)
     else
-        msg.debugging("Bad index passed to precast_delayed_cast")
+        logit(' : nil-or-false')
     end
-end
+    if val2 then
+        if type(val2) == 'table' and val2.type then logit(' : '..val2.type)
+        else
+            logit(' : Unknown type val2- '..tostring(val2))
+        end
+    else
+        logit(' : nil-or-false')
+    end
 
-
------------------------------------------------------------------------------------
---Name: send_action(ts)
---Desc: Sends the cued action packet, if it exists.
---Args:
----- ts - index for a command_registry entry that includes an action packet (hopefully)
------------------------------------------------------------------------------------
---Returns:
----- none
------------------------------------------------------------------------------------
-function send_action(ts)
-    command_registry[ts].midaction = true
-    equip_sets('midcast',ts,command_registry[ts].spell)
+    if type(swap_type) == 'string' then
+        msg.debugging("Entering "..swap_type)
+    else
+        msg.debugging("Entering User Event "..tostring(swap_type))
+    end
 end

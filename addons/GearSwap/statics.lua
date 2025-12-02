@@ -34,6 +34,8 @@ action_type_map = {['/ja']='Ability',['/jobability']='Ability',['/so']='Magic',[
     ['/ra']='Ranged Attack',['/range']='Ranged Attack',['/throw']='Ranged Attack',['/shoot']='Ranged Attack',['/ms']='Ability',['/monsterskill']='Ability',
     ['/ws']='Ability',['/weaponskill']='Ability',['/item']='Item',['/pet']='Ability',['/bstpet']='Ability',['Monster']='Monster Move'}
 
+res_prefix_map = {['/ma']='spells',['/ms']='monster_skills',['/ja']='job_abilities',['/ws']='weapon_skills',['/item']='items',['/ra']='ranged_attacks'}
+
 equippable_item_bags = {res.bags:equippable(true):extract()}
 
 usable_item_bags = {res.bags:with('command','temporary'), table.extract(equippable_item_bags)}
@@ -46,6 +48,9 @@ end
 bstpet_range = {min=672,max=798} -- Range of the JA resource devoted to BST jugpet abilities
 
 delay_map_to_action_type = {['Ability']=3,['Magic']=20,['Ranged Attack']=10,['Item']=10,['Monster Move']=10,['Interruption']=3}
+
+-- Phony resource so ranged attacks can be treated similarly to other actions
+res.ranged_attacks = {[0] = {id="0",index="0",prefix="/range",range=25,english="Ranged",german="Fernwaffe",french="Attaque à dist.",japanese="飛び道具",type="Misc",element="None",targets=S{"Enemy"}}}
 
 validabils = {}
 validabils['english'] = {['/ma'] = {}, ['/ja'] = {}, ['/ws'] = {}, ['/item'] = {}, ['/ra'] = {}, ['/ms'] = {}, ['/pet'] = {}, ['/trig'] = {}, ['/echo'] = {}}
@@ -81,16 +86,15 @@ for i,v in pairs(res.weapon_skills) do
     make_entry(v,i)
 end
 
-for i,v in pairs(res.monster_skills) do
-    v.type = 'MonsterSkill'
-    make_entry(v,i)
-end
-
 for i,v in pairs(res.items) do
     v.prefix = '/item'
     if not validabils['english'][v.prefix][v.english:lower()] or v.cast_delay then
         make_entry(v,i)
     end
+end
+
+for i,v in pairs(res.ranged_attacks) do
+    make_entry(v,i)
 end
 
     -- Should transition these slot maps to be based off res.slots, but it's very unlikely to change.
@@ -130,8 +134,6 @@ addendum_white = {[14]="Poisona",[15]="Paralyna",[16]="Blindna",[17]="Silena",[1
 addendum_black = {[253]="Sleep",[259]="Sleep II",[260]="Dispel",[162]="Stone IV",[163]="Stone V",[167]="Thunder IV",
     [168]="Thunder V",[157]="Aero IV",[158]="Aero V",[152]="Blizzard IV",[153]="Blizzard V",[147]="Fire IV",[148]="Fire V",
     [172]="Water IV",[173]="Water V",[255]="Break"}
-
-resources_ranged_attack = {id="0",index="0",prefix="/range",range=25,english="Ranged",german="Fernwaffe",french="Attaque à dist.",japanese="飛び道具",type="Misc",element="None",targets=S{"Enemy"}}
 
 
 -- _globals --
@@ -205,11 +207,11 @@ for i=0,15 do
     injected_equipment_registry[i] = L{}
 end
 
+global_init = {pretarget_cast_delay=0,precast_cast_delay=0,cancel_spell=false,new_target=false,target_arrow={x=0,y=0,z=0}}
 
 _global = make_user_table()
-_global.pretarget_cast_delay = 0
-_global.precast_cast_delay = 0
-_global.cancel_spell = false
+_global.target_arrow = {}
+table.update(_global,global_init,true)
 _global.current_event = 'None'
 
 _settings = {debug_mode = false, demo_mode = false, show_swaps = false}

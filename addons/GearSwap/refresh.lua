@@ -173,9 +173,7 @@ function load_user_files(job_id,user_file)
         return nil
     end
 
-    _global.pretarget_cast_delay = 0
-    _global.precast_cast_delay = 0
-    _global.cancel_spell = false
+    table.update(_global,global_init,true)
     _global.current_event = 'get_sets'
     user_pcall('get_sets')
 
@@ -257,6 +255,7 @@ function refresh_player(dt,user_event_flag)
             table.reassign(pet, {isvalid=false})
         end
 
+        player.species = nil
         if player.main_job_id == 18 or player.sub_job_id == 18 then
             local auto_tab
             if player.main_job_id == 18 then auto_tab = windower.ffxi.get_mjob_data()
@@ -322,8 +321,6 @@ function refresh_player(dt,user_event_flag)
                     end
                 end
             end
-        else
-            player.species = nil
         end
     end
 
